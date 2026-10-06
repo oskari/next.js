@@ -13,7 +13,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "types": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node test/smoke.mjs && node test/redis.mjs && node test/gcs.mjs"
+    "test": "npm run build && node test/smoke.mjs && node test/redis.mjs && node test/gcs.mjs && node test/deploy.mjs"
   },
   "dependencies": {
     "@next/routing": "16.5.0-canary.0",

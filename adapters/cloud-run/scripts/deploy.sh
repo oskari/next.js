@@ -1,36 +1,23 @@
 #!/usr/bin/env bash
-# Deploys a Next.js app built with this adapter to Cloud Run.
+# Releases a Next.js app built with this adapter to Cloud Run.
 #
-# Usage: scripts/deploy.sh [project-dir]
+# Usage: TF_DIR=path/to/terraform scripts/deploy.sh [project-dir]
 #
-# Environment:
-#   SERVICE   Cloud Run service name (default: project directory name)
-#   REGION    Cloud Run region (default: us-central1)
-#   PUBLIC=1  Allow unauthenticated access
-#   INGRESS   Cloud Run ingress, e.g. internal-and-cloud-load-balancing to
-#             only accept traffic through the load balancer (default: all)
-#   REDIS_URL Memorystore endpoint for the Redis cache handlers (build with
-#             NEXT_CLOUD_RUN_CACHE=redis), e.g. redis://10.0.0.3:6379
-#   VPC_NETWORK / VPC_SUBNET
-#             Direct VPC egress so the service can reach Memorystore's
-#             private IP (VPC_SUBNET defaults to VPC_NETWORK)
-#   BUCKET    Optional Cloud Storage bucket for /_next/static assets. Pair it
-#             with NEXT_CLOUD_RUN_ASSET_PREFIX at build time and a load
-#             balancer backend bucket with Cloud CDN enabled.
-#   IMAGE_CACHE_BUCKET
-#             Cloud Storage bucket for optimized images, shared by all
-#             instances instead of instance memory or Memorystore
+# With TF_DIR, infrastructure and service settings come from the Terraform
+# module in ../terraform; this script only ships a release:
+#   1. builds the container image with Cloud Build and pushes it to the
+#      module's Artifact Registry repository,
+#   2. uploads /_next/static to the static bucket (before the new revision
+#      goes live, so its HTML never references missing assets),
+#   3. rolls the new image out to the app service and the image service.
+# Each value can also be passed directly instead of TF_DIR: PROJECT, REGION,
+# APP_SERVICE, IMAGE_SERVICE, STATIC_BUCKET, ARTIFACT_REPOSITORY, URL.
 #
-# Dedicated image service (route /_next/image to it with setup-lb.sh):
-#   IMAGE_SERVICE=1     Also deploy the same container image as a second
-#                       service tuned for image optimization
-#   IMAGE_SERVICE_NAME  default: $SERVICE-images
-#   IMAGE_MEMORY        default: 2Gi
-#   IMAGE_CPU           default: 2
-#   IMAGE_CONCURRENCY   default: 16
-#   IMAGE_MAX_INSTANCES default: unset (Cloud Run default)
+# Without TF_DIR or ARTIFACT_REPOSITORY it is a quick start: one service
+# deployed with `gcloud run deploy --source`, public unless PUBLIC=0, named
+# after the project directory or SERVICE, in REGION (default us-central1).
 #
-# Prints the app service URL on stdout; everything else goes to stderr.
+# Prints the app URL on stdout; everything else goes to stderr.
 set -euo pipefail
 
 PROJECT_DIR="$(cd "${1:-.}" && pwd)"
@@ -40,84 +27,66 @@ if [ ! -f "$OUT/Dockerfile" ]; then
   exit 1
 fi
 
-SERVICE="${SERVICE:-$(basename "$PROJECT_DIR")}"
+if [ -n "${TF_DIR:-}" ]; then
+  # Read the module outputs; values already set in the environment win.
+  eval "$(terraform -chdir="$TF_DIR" output -json | node -e '
+    const outputs = JSON.parse(require("fs").readFileSync(0, "utf8"))
+    const names = {
+      project_id: "PROJECT", region: "REGION", app_service: "APP_SERVICE",
+      image_service: "IMAGE_SERVICE", static_bucket: "STATIC_BUCKET",
+      artifact_repository: "ARTIFACT_REPOSITORY", url: "URL",
+    }
+    for (const [output, name] of Object.entries(names)) {
+      const value = outputs[output]?.value
+      if (value == null || value === "") continue
+      const quoted = "\x27" + String(value).replace(/\x27/g, "\x27\\\x27\x27") + "\x27"
+      console.log(`[ -n "\${${name}:-}" ] || ${name}=${quoted}`)
+    }
+  ')"
+fi
+
 REGION="${REGION:-us-central1}"
+project_args=()
+if [ -n "${PROJECT:-}" ]; then project_args=(--project "$PROJECT"); fi
 
-# Use the longest maxDuration of any route as the request timeout.
-TIMEOUT="$(node -e '
-const m = require(process.argv[1])
-const d = Object.values(m.functions).map((f) => f.maxDuration || 0)
-console.log(Math.max(300, ...d))
-' "$OUT/app/cloud-run-manifest.json")"
+if [ -z "${ARTIFACT_REPOSITORY:-}" ]; then
+  # Quick start without Terraform.
+  service="${APP_SERVICE:-${SERVICE:-$(basename "$PROJECT_DIR")}}"
+  auth=(--allow-unauthenticated)
+  if [ "${PUBLIC:-}" = "0" ]; then auth=(--no-allow-unauthenticated); fi
+  gcloud run deploy "$service" --source "$OUT" --region "$REGION" \
+    ${project_args[@]+"${project_args[@]}"} "${auth[@]}" >&2
+  gcloud run services describe "$service" --region "$REGION" \
+    ${project_args[@]+"${project_args[@]}"} --format 'value(status.url)'
+  exit 0
+fi
 
-if [ -n "${BUCKET:-}" ]; then
-  # Upload before deploying so new HTML never references missing assets.
-  # Hashed assets are immutable and are never deleted by this script, so
-  # clients on the previous deployment keep working.
+: "${APP_SERVICE:?Set TF_DIR or APP_SERVICE}"
+build_id="$(cat "$PROJECT_DIR/.next/BUILD_ID" 2>/dev/null || date +%s)"
+image="$ARTIFACT_REPOSITORY/$APP_SERVICE:$(echo "$build_id" | tr -c 'A-Za-z0-9_.\n-' '-')"
+
+gcloud builds submit "$OUT" --tag "$image" \
+  ${project_args[@]+"${project_args[@]}"} >&2
+
+if [ -n "${STATIC_BUCKET:-}" ]; then
+  # Hashed assets are immutable and never deleted here, so clients still on
+  # the previous revision keep working.
   gcloud storage rsync --recursive "$OUT/static/_next/static" \
-    "gs://$BUCKET/_next/static" \
-    --cache-control="public, max-age=31536000, immutable" >&2
+    "gs://$STATIC_BUCKET/_next/static" \
+    --cache-control="public, max-age=31536000, immutable" \
+    ${project_args[@]+"${project_args[@]}"} >&2
 fi
 
-# Settings shared by the app and image services.
-common=(
-  --region "$REGION"
-  # Keep CPU allocated after the response so waitUntil work (background ISR
-  # and image revalidation, after()) can finish.
-  --no-cpu-throttling
-)
-if [ "${PUBLIC:-}" = "1" ]; then
-  common+=(--allow-unauthenticated)
-fi
-if [ -n "${INGRESS:-}" ]; then
-  common+=(--ingress "$INGRESS")
-fi
-env_vars=()
-if [ -n "${REDIS_URL:-}" ]; then
-  env_vars+=("REDIS_URL=$REDIS_URL")
-fi
-if [ -n "${IMAGE_CACHE_BUCKET:-}" ]; then
-  env_vars+=("NEXT_CLOUD_RUN_IMAGE_CACHE_BUCKET=$IMAGE_CACHE_BUCKET")
-fi
-if [ ${#env_vars[@]} -gt 0 ]; then
-  # gcloud's ^|^ prefix sets "|" as the delimiter, so values may contain
-  # commas or "@" (e.g. a Redis URL with credentials).
-  common+=(--update-env-vars "^|^$(IFS='|'; echo "${env_vars[*]}")")
-fi
-if [ -n "${VPC_NETWORK:-}" ]; then
-  common+=(
-    --network "$VPC_NETWORK"
-    --subnet "${VPC_SUBNET:-$VPC_NETWORK}"
-    --vpc-egress private-ranges-only
-  )
-fi
+for service in "$APP_SERVICE" ${IMAGE_SERVICE:+"$IMAGE_SERVICE"}; do
+  # Only the image changes; Terraform owns every other setting and ignores
+  # the image field, so the two never fight.
+  gcloud run deploy "$service" --image "$image" --region "$REGION" \
+    ${project_args[@]+"${project_args[@]}"} >&2
+done
 
-gcloud run deploy "$SERVICE" --source "$OUT" --timeout "$TIMEOUT" \
-  "${common[@]}" >&2
-
-if [ "${IMAGE_SERVICE:-}" = "1" ]; then
-  # Reuse the image Cloud Build just produced instead of building it twice.
-  # The same server handles /_next/image; local source images are inside
-  # the image, so this service needs nothing else.
-  image="$(gcloud run services describe "$SERVICE" --region "$REGION" \
-    --format 'value(spec.template.spec.containers[0].image)')"
-  image_args=(
-    --image "$image"
-    --memory "${IMAGE_MEMORY:-2Gi}"
-    --cpu "${IMAGE_CPU:-2}"
-    # Decoding and encoding are CPU- and memory-heavy; fewer concurrent
-    # requests per instance keeps memory bounded and scales out earlier.
-    --concurrency "${IMAGE_CONCURRENCY:-16}"
-    --timeout 60
-  )
-  if [ -n "${IMAGE_MAX_INSTANCES:-}" ]; then
-    image_args+=(--max-instances "$IMAGE_MAX_INSTANCES")
-  fi
-  image_service="${IMAGE_SERVICE_NAME:-$SERVICE-images}"
-  gcloud run deploy "$image_service" "${image_args[@]}" "${common[@]}" >&2
-  echo "Image service: $(gcloud run services describe "$image_service" \
-    --region "$REGION" --format 'value(status.url)')" >&2
+if [ -n "${URL:-}" ]; then
+  echo "$URL"
+else
+  gcloud run services describe "$APP_SERVICE" --region "$REGION" \
+    ${project_args[@]+"${project_args[@]}"} --format 'value(status.url)'
 fi
-
-gcloud run services describe "$SERVICE" --region "$REGION" \
-  --format 'value(status.url)'
