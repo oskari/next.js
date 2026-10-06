@@ -1,6 +1,6 @@
 # next-adapter-cloud-run
 
-A [Next.js Deployment Adapter](../../docs/01-app/03-api-reference/07-adapters/index.mdx) that packages a Next.js app as a single Google Cloud Run service.
+A [Next.js Deployment Adapter](https://nextjs.org/docs/app/api-reference/adapters) that packages a Next.js app as a single Google Cloud Run service.
 
 > Status: scaffold. It handles routing, middleware/proxy, app and pages router entrypoints, ISR, static and `public/` files, image optimization, and an optional shared cache on Memorystore. See [Limitations](#limitations) and [Roadmap](#roadmap) before using it in production.
 
@@ -22,7 +22,7 @@ At build time (`onBuildComplete`) the adapter writes `<project>/.cloud-run/`:
 
 At runtime, `server.mjs` handles every request:
 
-1. Resolves Next.js routing (redirects, rewrites, headers, middleware/proxy, dynamic routes) with [`@next/routing`](../../packages/next-routing).
+1. Resolves Next.js routing (redirects, rewrites, headers, middleware/proxy, dynamic routes) with [`@next/routing`](https://github.com/vercel/next.js/tree/canary/packages/next-routing).
 2. Calls the Node.js middleware entrypoint when `routing.middlewareMatchers` match.
 3. Serves the static file, optimizes `/_next/image` requests, or calls the matched entrypoint's `handler(req, res, ctx)` with the resolved invocation target.
 4. Tracks `ctx.waitUntil` promises and drains them on `SIGTERM`.
@@ -147,7 +147,7 @@ builds `test/fixture` with the adapter, starts the generated server and checks p
 
 ### Next.js compatibility suite
 
-`scripts/e2e-deploy.sh`, `scripts/e2e-logs.sh` and `scripts/e2e-cleanup.sh` implement the [adapter test harness contract](../../docs/01-app/03-api-reference/07-adapters/04-testing-adapters.mdx). From a Next.js checkout:
+`scripts/e2e-deploy.sh`, `scripts/e2e-logs.sh` and `scripts/e2e-cleanup.sh` implement the [adapter test harness contract](https://nextjs.org/docs/app/api-reference/adapters/testing-adapters). From a Next.js checkout:
 
 ```bash
 NEXT_TEST_MODE=deploy \
