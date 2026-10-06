@@ -50,76 +50,106 @@ next build
 PORT=3000 node .cloud-run/app/server.mjs
 ```
 
-### Deploy
+### Deploy to Google Cloud
 
-```bash
-next build
-SERVICE=my-app REGION=europe-north1 PUBLIC=1 scripts/deploy.sh .
-```
+Infrastructure is a Terraform module in [`terraform/`](terraform); releases are shipped by `scripts/deploy.sh`.
 
-`scripts/deploy.sh` runs `gcloud run deploy --source .cloud-run`, so Cloud Build builds the image from the generated Dockerfile. It sets:
+1. **Provision once** (and whenever settings change) with one of the examples, or your own module call:
 
-- `--no-cpu-throttling`, so background work started through `waitUntil` (ISR revalidation, `after()`) keeps CPU after the response is sent.
-- `--timeout` to the longest `maxDuration` of any route (at least 300s).
+   ```bash
+   cd terraform/examples/production   # or examples/free-tier
+   terraform init
+   terraform apply -var project_id=my-project -var domain=shop.example.com
+   ```
+
+   The module creates the Cloud Run services (with a placeholder image until the first release), an Artifact Registry repository, a runtime service account, the buckets, and, by default, the load balancer with Cloud CDN and Cloud Armor. See [Infrastructure](#infrastructure) for what it creates and how to turn parts off.
+
+2. **Release** each build:
+
+   ```bash
+   next build
+   TF_DIR=terraform/examples/production scripts/deploy.sh .
+   ```
+
+   `deploy.sh` reads the module outputs, builds the container image with Cloud Build into the module's registry, uploads `/_next/static` to the static bucket, then rolls the new image out to the app and image services. It changes only the image; Terraform owns every other setting and ignores the image field, so `terraform apply` never rolls a release back. Values can also come from the environment (`PROJECT`, `REGION`, `APP_SERVICE`, `IMAGE_SERVICE`, `STATIC_BUCKET`, `ARTIFACT_REPOSITORY`, `URL`) instead of `TF_DIR`. Whoever runs it needs permission to push to the registry and deploy the services.
+
+**Quick start without Terraform:** `scripts/deploy.sh .` with no `TF_DIR` deploys a single public service from source (`gcloud run deploy --source`), named after the project directory or `SERVICE`, in `REGION` (default `us-central1`). `PUBLIC=0` keeps it private.
 
 Build on Linux x64 (or in Cloud Build), so native dependencies match the container. This matters for `sharp`, which image optimization uses: the adapter keeps only the linux-x64-glibc `@img/sharp-*` binaries and warns at build time when they are missing. On another platform, run `npm install --os=linux --cpu=x64 --libc=glibc sharp` before building.
 
+### Trying it within the free tier
+
+[`terraform/examples/free-tier`](terraform/examples/free-tier) stays within the Google Cloud free tier as far as possible: one app service in `us-central1` that scales to zero and only uses CPU during requests, an image cache bucket, and a registry that keeps two image versions. It leaves out the load balancer, Cloud CDN, Cloud Armor and Memorystore, which have no free tier.
+
+```bash
+EXAMPLE=$PWD/terraform/examples/free-tier
+terraform -chdir=$EXAMPLE init
+terraform -chdir=$EXAMPLE apply -var project_id=my-project
+
+# From your Next.js app, built with this adapter:
+next build && TF_DIR=$EXAMPLE /path/to/next-adapter-cloud-run/scripts/deploy.sh .
+
+# When done:
+terraform -chdir=$EXAMPLE destroy -var project_id=my-project
+```
+
+- To try the load balancer, CDN and image service, apply with `-var enable_load_balancer=true` and destroy afterwards; a few hours costs little, but check current pricing.
+- With CPU only during requests, background ISR revalidation and `after()` work may be delayed until the next request reaches the instance.
+- Cloud Build keeps uploaded sources in a `<project>_cloudbuild` bucket, which counts towards the Cloud Storage allowance.
+- Set a budget alert on the billing account before trying the paid parts.
+
 ### Image optimization
 
-`/_next/image` is served with Next.js' own image optimizer and the same validation, headers and caching as `next start`. Local images are fetched through the server's in-process routing; remote images must match `images.remotePatterns`. Optimized images are cached in the [image cache bucket](#load-balancer-cloud-cdn-and-a-dedicated-image-service) when one is configured, otherwise in Memorystore when the shared cache is enabled, otherwise on the instance's disk (which is memory on Cloud Run). With `images.unoptimized`, a custom `images.loader` or `output: 'export'`, `/_next/image` returns 404 as in `next start`. Without `sharp`, the original image is served and a warning is logged.
+`/_next/image` is served with Next.js' own image optimizer and the same validation, headers and caching as `next start`. Local images are fetched through the server's in-process routing; remote images must match `images.remotePatterns`. Optimized images are cached in the [image cache bucket](#infrastructure) when one is configured, otherwise in Memorystore when the shared cache is enabled, otherwise on the instance's disk (which is memory on Cloud Run). With `images.unoptimized`, a custom `images.loader` or `output: 'export'`, `/_next/image` returns 404 as in `next start`. Without `sharp`, the original image is served and a warning is logged.
 
 ### Shared cache on Memorystore
 
 Every build points `cacheHandler` and `cacheHandlers` (`default`, `remote`) at the adapter's handlers. Handlers configured by the app take priority, and `NEXT_CLOUD_RUN_CACHE=local` at build time opts out. Without `REDIS_URL` the handlers are Next.js' own file-system and in-memory caches, so the same build works with or without Memorystore. Set `REDIS_URL` at runtime and ISR and route responses, the `fetch` data cache and `'use cache'` entries are shared by all instances, and `revalidateTag`/`revalidatePath` reach every instance. Optimized images also go through Redis when there is no image cache bucket.
 
-```bash
-next build
-REDIS_URL=redis://10.0.0.3:6379 VPC_NETWORK=default scripts/deploy.sh .
-```
+With the Terraform module, `memorystore = { enabled = true }` creates a Memorystore for Redis instance, sets `REDIS_URL` on both services and connects them over Direct VPC egress. To use an existing instance instead, pass `redis_url` (and `vpc` for the network).
 
-- Use Memorystore for Redis, or Memorystore for Valkey with cluster mode disabled. Reach it over Direct VPC egress (`VPC_NETWORK`/`VPC_SUBNET`). Use `rediss://` and `REDIS_CA_CERT` for in-transit encryption.
-- Set `maxmemory-policy` to `allkeys-lru` so Redis evicts old entries under memory pressure. Entries also expire after their `expire` time, or `NEXT_REDIS_DEFAULT_TTL` (30 days) when they have none.
+- Memorystore for Redis, or Memorystore for Valkey with cluster mode disabled, both work. `memorystore.transit_encryption = true` switches to `rediss://` and sets `REDIS_CA_CERT`.
+- Redis should evict old entries under memory pressure with `maxmemory-policy allkeys-lru`, which the module sets. Entries also expire after their `expire` time, or `NEXT_REDIS_DEFAULT_TTL` (30 days) when they have none.
 - Response, image and `'use cache'` entries are scoped to the build ID, so a new revision never reads another build's pages. `fetch` entries and tags are shared across builds.
 - A miss falls back to the build's prerendered pages on local disk.
 - When Redis is unreachable, requests are served as cache misses after at most a one-time 2s wait for the first connection, and tag invalidations apply only on the instance that received them.
 
-### Load balancer, Cloud CDN and a dedicated image service
+### Infrastructure
 
-The service alone serves the whole app. For production traffic, put a global external Application Load Balancer in front of it and give image optimization its own service:
+The Terraform module turns on everything that is safe by default; each part has an opt-out, and parts that need an input switch on when it is given:
 
-```bash
-next build
+| Part                                                                       | Default                                               | Turn off / configure                                                  |
+| -------------------------------------------------------------------------- | ----------------------------------------------------- | --------------------------------------------------------------------- |
+| App service                                                                | on; CPU always allocated so `waitUntil` work finishes | `app = {...}`, `cpu_always_allocated = false`                         |
+| Image service (`<name>-images`): same image, 2 vCPU, 2 GiB, concurrency 16 | on                                                    | `image_service = { enabled = false }`                                 |
+| Static bucket for `/_next/static` (public)                                 | on                                                    | `static_bucket = { enabled = false }`                                 |
+| Image cache bucket (private, objects deleted after 30 days)                | on                                                    | `image_cache_bucket = { enabled = false, ttl_days = … }`              |
+| Global external Application Load Balancer                                  | on                                                    | `load_balancer = { enabled = false }`                                 |
+| Cloud CDN on static, image and app backends                                | on                                                    | `load_balancer = { app_cdn = false }` (static and image always cache) |
+| Cloud Armor XSS/SQLi rules, preview (log-only)                             | on                                                    | `load_balancer = { armor = false }` or `armor_enforce = true`         |
+| HTTPS with a managed certificate, HTTP→HTTPS redirect                      | when `domain` is set                                  | `load_balancer = { domain = "…", https_redirect = false }`            |
+| Ingress only through the load balancer                                     | with the load balancer                                | `ingress = "INGRESS_TRAFFIC_ALL"`                                     |
+| Public invoker (`allUsers`)                                                | on                                                    | `allow_unauthenticated = false`                                       |
+| Memorystore + Direct VPC egress                                            | off (no free tier)                                    | `memorystore = { enabled = true }`, or `redis_url`                    |
+| Artifact Registry cleanup                                                  | keep 10 versions                                      | `artifact_registry = { keep_versions = … }`                           |
 
-SERVICE=shop REGION=europe-north1 \
-  BUCKET=shop-static IMAGE_CACHE_BUCKET=shop-images-cache \
-  IMAGE_SERVICE=1 \
-  REDIS_URL=redis://10.0.0.3:6379 VPC_NETWORK=default \
-  scripts/deploy.sh .
+The load balancer routes requests like this:
 
-SERVICE=shop REGION=europe-north1 \
-  BUCKET=shop-static IMAGE_CACHE_BUCKET=shop-images-cache \
-  IMAGE_SERVICE=1 DOMAIN=shop.example.com ARMOR=1 \
-  scripts/setup-lb.sh
+| Path              | Backend                          | Cloud CDN                     |
+| ----------------- | -------------------------------- | ----------------------------- |
+| `/_next/static/*` | Static bucket (hashed assets)    | Yes                           |
+| `/_next/image`    | Image service, otherwise the app | Yes                           |
+| everything else   | App service                      | Yes, unless `app_cdn = false` |
 
-# Once DNS points at the load balancer, close the run.app URLs:
-INGRESS=internal-and-cloud-load-balancing ... scripts/deploy.sh .
-```
+- **Image service.** Image bursts scale on their own and never slow down page rendering. It runs the same server, and local source images are inside the image.
+- **Cloud CDN for images.** Optimized images are sent with `Cache-Control: public, max-age=…` (`images.minimumCacheTTL`, 4 hours by default, or a year for static imports) and `Vary: Accept`, which Cloud CDN caches per format, so most image requests never reach Cloud Run.
+- **Cloud CDN for pages.** Next.js pages vary on router headers (`rsc`, `next-router-state-tree`, …), which Cloud CDN does not cache unless they are part of the cache key, so the app backend mainly caches public route handlers and metadata files. Responses cached at the CDN are not purged by `revalidateTag` yet.
+- **Image cache bucket.** Optimized images are stored in Cloud Storage and shared by every instance of both services, instead of instance memory or Memorystore. Requests use the service's own credentials from the metadata server. If the bucket errors, images are optimized as cache misses; after a timeout the bucket is skipped for 10 seconds, so a slow bucket costs at most one timeout per request.
+- **Static assets.** `deploy.sh` uploads the hashed assets before the new revision goes live and never deletes old ones, so clients on the previous revision keep working. Build with `NEXT_CLOUD_RUN_ASSET_PREFIX=https://cdn.example.com` only when the assets live on a different domain.
+- **Cloud Armor** starts in preview mode: matches are logged but not blocked. Review the logs before setting `armor_enforce = true`.
+- Set `load_balancer.base_path` when the app uses `basePath`.
 
-`scripts/setup-lb.sh` creates the load balancer, or updates it when run again:
-
-| Path              | Backend                                                 | Cloud CDN                |
-| ----------------- | ------------------------------------------------------- | ------------------------ |
-| `/_next/static/*` | Backend bucket on `BUCKET` (hashed assets, made public) | Yes                      |
-| `/_next/image`    | Image service (`IMAGE_SERVICE=1`), otherwise the app    | Yes on the image service |
-| everything else   | App service                                             | Only with `APP_CDN=1`    |
-
-- **Image service.** With `IMAGE_SERVICE=1`, `deploy.sh` deploys the image Cloud Build just built a second time as `$SERVICE-images`, with more memory and CPU and a lower concurrency (`IMAGE_MEMORY`, `IMAGE_CPU`, `IMAGE_CONCURRENCY`, `IMAGE_MAX_INSTANCES`). Image bursts then scale on their own and never slow down page rendering. The service runs the same server, and local source images are inside the image.
-- **Cloud CDN for images.** Optimized images are sent with `Cache-Control: public, max-age=…` (`images.minimumCacheTTL`, 4 hours by default, or a year for static imports) and `Vary: Accept`. Cloud CDN caches them per format, so most image requests never reach Cloud Run.
-- **Cloud CDN for pages.** Next.js pages vary on router headers (`rsc`, `next-router-state-tree`, …), which Cloud CDN does not cache unless they are part of the cache key. `APP_CDN=1` is therefore safe but mainly helps public route handlers and metadata files. Pages cached at the CDN are not purged by `revalidateTag` yet.
-- **Image cache bucket.** With `IMAGE_CACHE_BUCKET`, optimized images are stored in Cloud Storage and shared by every instance of both services, instead of instance memory or Memorystore. `setup-lb.sh` creates the bucket with a lifecycle rule that deletes objects after `IMAGE_CACHE_TTL_DAYS` (30), and grants the services' runtime service accounts object access. Requests use the service's own credentials from the metadata server. If the bucket errors, images are optimized as cache misses; after a timeout the bucket is skipped for 10 seconds, so a slow bucket costs at most one timeout per request.
-- **Static assets.** `deploy.sh` uploads the hashed assets to `BUCKET` before deploying the new revision and never deletes old ones, so clients on the previous deployment keep working. Build with `NEXT_CLOUD_RUN_ASSET_PREFIX=https://cdn.example.com` only when the assets live on a different domain.
-- **Cloud Armor.** `ARMOR=1` attaches a policy with preconfigured XSS and SQLi rules in preview mode: matches are logged but not blocked. Review the logs before enforcing them.
-- `DOMAIN` provisions a Google-managed certificate for HTTPS. Without it the load balancer serves HTTP on port 80. Set `BASE_PATH` when the app uses `basePath`.
+See [`terraform/variables.tf`](terraform/variables.tf) for every variable, and the example READMEs for complete setups.
 
 ## Configuration
 
@@ -143,7 +173,13 @@ INGRESS=internal-and-cloud-load-balancing ... scripts/deploy.sh .
 npm test
 ```
 
-builds `test/fixture` with the adapter, starts the generated server and checks pages, route handlers, rewrites, redirects, middleware, RSC requests, static and `public/` files, image optimization, 404s and ISR revalidation. It then builds `test/fixture-redis` with the Redis handlers and runs two instances against a local `redis-server` (skipped when it is not installed) to check that cached values, tag invalidations, on-demand ISR and optimized images are shared, and that pages stay fast when Redis is down. Finally it runs two instances against a mock of the Cloud Storage API to check the shared image cache, stale regeneration, and fast fallback when the bucket errors or hangs.
+builds `test/fixture` with the adapter, starts the generated server and checks pages, route handlers, rewrites, redirects, middleware, RSC requests, static and `public/` files, image optimization, 404s and ISR revalidation. It then builds `test/fixture-redis` with the Redis handlers and runs two instances against a local `redis-server` (skipped when it is not installed) to check that cached values, tag invalidations, on-demand ISR and optimized images are shared, and that pages stay fast when Redis is down. Finally it runs two instances against a mock of the Cloud Storage API to check the shared image cache, stale regeneration, and fast fallback when the bucket errors or hangs. `test/deploy.mjs` runs `scripts/deploy.sh` against fake `gcloud` and `terraform` binaries.
+
+The Terraform module has its own tests, which run against a mocked Google provider:
+
+```bash
+cd terraform && terraform init -backend=false && terraform test
+```
 
 ### Next.js compatibility suite
 
