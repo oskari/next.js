@@ -1,7 +1,0 @@
-{
-  "name": "cloud-run-adapter-fixture-redis",
-  "private": true,
-  "scripts": {
-    "build": "next build"
-  }
-}
