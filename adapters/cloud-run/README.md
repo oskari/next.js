@@ -70,10 +70,10 @@ Build on Linux x64 (or in Cloud Build), so native dependencies match the contain
 
 ### Shared cache on Memorystore
 
-Build with `NEXT_CLOUD_RUN_CACHE=redis` to point `cacheHandler` and `cacheHandlers` (`default`, `remote`) at the adapter's Redis handlers. Handlers configured by the app take priority. Then ISR and route responses, the `fetch` data cache, `'use cache'` entries and optimized images are shared by all instances, and `revalidateTag`/`revalidatePath` reach every instance.
+Every build points `cacheHandler` and `cacheHandlers` (`default`, `remote`) at the adapter's handlers. Handlers configured by the app take priority, and `NEXT_CLOUD_RUN_CACHE=local` at build time opts out. Without `REDIS_URL` the handlers are Next.js' own file-system and in-memory caches, so the same build works with or without Memorystore. Set `REDIS_URL` at runtime and ISR and route responses, the `fetch` data cache and `'use cache'` entries are shared by all instances, and `revalidateTag`/`revalidatePath` reach every instance. Optimized images also go through Redis when there is no image cache bucket.
 
 ```bash
-NEXT_CLOUD_RUN_CACHE=redis next build
+next build
 REDIS_URL=redis://10.0.0.3:6379 VPC_NETWORK=default scripts/deploy.sh .
 ```
 
@@ -88,7 +88,7 @@ REDIS_URL=redis://10.0.0.3:6379 VPC_NETWORK=default scripts/deploy.sh .
 The service alone serves the whole app. For production traffic, put a global external Application Load Balancer in front of it and give image optimization its own service:
 
 ```bash
-NEXT_CLOUD_RUN_CACHE=redis next build
+next build
 
 SERVICE=shop REGION=europe-north1 \
   BUCKET=shop-static IMAGE_CACHE_BUCKET=shop-images-cache \
@@ -127,7 +127,7 @@ INGRESS=internal-and-cloud-load-balancing ... scripts/deploy.sh .
 | ----------------------------- | ------- | ---------------------------------------------------------------- |
 | `NEXT_CLOUD_RUN_OUT_DIR`      | build   | Output directory, relative to the project (default `.cloud-run`) |
 | `NEXT_CLOUD_RUN_ASSET_PREFIX` | build   | Sets `assetPrefix` when the config does not                      |
-| `NEXT_CLOUD_RUN_CACHE`        | build   | `redis` enables the Memorystore cache handlers                   |
+| `NEXT_CLOUD_RUN_CACHE`        | build   | `local` opts out of the adapter's cache handlers                 |
 | `REDIS_URL`                   | runtime | Memorystore endpoint (`redis://` or `rediss://`)                 |
 | `REDIS_CA_CERT`               | runtime | PEM CA certificate for `rediss://`                               |
 | `NEXT_REDIS_KEY_PREFIX`       | runtime | Redis key prefix (default `next`)                                |

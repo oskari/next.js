@@ -26,7 +26,66 @@ const remoteUrl = `http://127.0.0.1:${remote.address().port}/remote.png`
 const image = (url, w = 640, q = 75) =>
   `/_next/image?url=${encodeURIComponent(url)}&w=${w}&q=${q}`
 
+const { default: adapter } = await import(
+  path.join(adapterDir, 'dist/index.js')
+)
+// next.config defaults hold `undefined` cacheHandlers entries.
+const baseConfig = {
+  cacheHandlers: { default: undefined, remote: undefined, static: undefined },
+  images: { customCacheHandler: false },
+}
+function modifyConfig(config, env = {}, phase = 'phase-production-build') {
+  const saved = process.env.NEXT_CLOUD_RUN_CACHE
+  if (env.NEXT_CLOUD_RUN_CACHE) {
+    process.env.NEXT_CLOUD_RUN_CACHE = env.NEXT_CLOUD_RUN_CACHE
+  } else {
+    delete process.env.NEXT_CLOUD_RUN_CACHE
+  }
+  try {
+    return adapter.modifyConfig({ ...baseConfig, ...config }, { phase })
+  } finally {
+    if (saved === undefined) delete process.env.NEXT_CLOUD_RUN_CACHE
+    else process.env.NEXT_CLOUD_RUN_CACHE = saved
+  }
+}
+
 const tests = {
+  async 'cache handlers are configured by default'() {
+    const config = modifyConfig({})
+    assert.match(config.cacheHandler, /dist\/cache\/incremental\.js$/)
+    assert.match(config.cacheHandlers.default, /dist\/cache\/use-cache\.js$/)
+    assert.equal(config.cacheHandlers.remote, config.cacheHandlers.default)
+    assert.equal(config.images.customCacheHandler, true)
+    // The fixture build (no REDIS_URL) runs with them, so every test below
+    // also covers their fallback to Next.js' local caches.
+    const serverFiles = JSON.parse(
+      fs.readFileSync(
+        path.join(fixtureDir, '.next/required-server-files.json'),
+        'utf8'
+      )
+    )
+    assert.match(serverFiles.config.cacheHandler, /incremental\.js$/)
+  },
+  async 'NEXT_CLOUD_RUN_CACHE=local opts out of the cache handlers'() {
+    const config = modifyConfig({}, { NEXT_CLOUD_RUN_CACHE: 'local' })
+    assert.equal(config.cacheHandler, undefined)
+    assert.equal(config.cacheHandlers.default, undefined)
+    assert.equal(config.images.customCacheHandler, false)
+  },
+  async "the app's own cache handlers take priority"() {
+    const config = modifyConfig({
+      cacheHandler: '/app/my-handler.js',
+      cacheHandlers: { remote: '/app/remote.js' },
+    })
+    assert.equal(config.cacheHandler, '/app/my-handler.js')
+    assert.equal(config.cacheHandlers.remote, '/app/remote.js')
+    assert.match(config.cacheHandlers.default, /use-cache\.js$/)
+    assert.equal(config.images.customCacheHandler, false)
+  },
+  async 'next dev keeps its own caches'() {
+    const config = modifyConfig({}, {}, 'phase-development-server')
+    assert.equal(config.cacheHandler, undefined)
+  },
   async 'static page with config headers'() {
     const res = await get('/')
     assert.equal(res.status, 200)

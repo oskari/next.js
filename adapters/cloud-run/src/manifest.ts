@@ -56,4 +56,9 @@ export interface ImagesEntry {
    * `images.customCacheHandler` routes optimized images through it.
    */
   cacheHandler?: string
+  /**
+   * The cacheHandler is the adapter's Redis handler, so images only use it
+   * when REDIS_URL is set at runtime.
+   */
+  cacheHandlerNeedsRedis?: boolean
 }

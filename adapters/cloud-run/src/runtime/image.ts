@@ -85,8 +85,8 @@ export async function createImageHandler({
   // Where optimized images are cached, in order of precedence:
   // - `NEXT_CLOUD_RUN_IMAGE_CACHE_BUCKET`: a Cloud Storage bucket, chosen at
   //   runtime and shared by all instances and services (`./gcs-image.mjs`).
-  // - `images.customCacheHandler`: the app's `cacheHandler` (e.g. the Redis
-  //   handler), chosen at build time.
+  // - `images.customCacheHandler`: the app's `cacheHandler`, chosen at build
+  //   time. The adapter's own Redis handler only applies with REDIS_URL.
   // - otherwise the instance's local `<distDir>/cache/images`, which lives in
   //   memory on Cloud Run.
   let cacheHandler: any
@@ -96,7 +96,10 @@ export async function createImageHandler({
     console.log(
       `[cloud-run] caching optimized images in ${cacheHandler.location}`
     )
-  } else if (images.cacheHandler) {
+  } else if (
+    images.cacheHandler &&
+    (!images.cacheHandlerNeedsRedis || process.env.REDIS_URL)
+  ) {
     const mod = await import(
       pathToFileURL(path.join(appRoot, images.cacheHandler)).href
     )

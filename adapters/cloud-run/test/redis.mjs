@@ -21,7 +21,8 @@ try {
 }
 
 const fixtureDir = path.join(adapterDir, 'test/fixture-redis')
-build(fixtureDir, { NEXT_CLOUD_RUN_CACHE: 'redis' })
+// A default build: the handlers use Redis because REDIS_URL is set below.
+build(fixtureDir)
 
 const redisPort = await freePort()
 const redis = spawn(

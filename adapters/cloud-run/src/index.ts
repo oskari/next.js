@@ -61,8 +61,10 @@ const adapter: NextAdapter = {
     }
 
     // Share the ISR, data and 'use cache' caches across instances through
-    // Redis (Memorystore). Handlers the app configures itself take priority.
-    if (process.env.NEXT_CLOUD_RUN_CACHE === 'redis') {
+    // Redis (Memorystore) when REDIS_URL is set at runtime; without it the
+    // handlers are Next.js' own local caches. NEXT_CLOUD_RUN_CACHE=local opts
+    // out at build time. Handlers the app configures itself take priority.
+    if (process.env.NEXT_CLOUD_RUN_CACHE !== 'local') {
       const useCacheHandler = path.join(cacheDir, 'use-cache.js')
       updated.cacheHandler ??= path.join(cacheDir, 'incremental.js')
       // The defaults hold `undefined` entries, so only keep set ones.
@@ -332,11 +334,13 @@ async function addImageOptimizer(
     )
   )
   let cacheHandler: string | undefined
+  let cacheHandlerNeedsRedis = false
   if (config.images.customCacheHandler && config.cacheHandler) {
     const handler = config.cacheHandler.startsWith('file://')
       ? fileURLToPath(config.cacheHandler)
       : path.resolve(ctx.projectDir, config.cacheHandler)
     cacheHandler = path.relative(ctx.repoRoot, handler)
+    cacheHandlerNeedsRedis = handler === path.join(cacheDir, 'incremental.js')
     await copyAsset(cacheHandler, handler)
   }
 
@@ -349,6 +353,7 @@ async function addImageOptimizer(
       cacheMaxMemorySize: config.cacheMaxMemorySize,
     },
     cacheHandler,
+    cacheHandlerNeedsRedis: cacheHandlerNeedsRedis || undefined,
   }
 }
 

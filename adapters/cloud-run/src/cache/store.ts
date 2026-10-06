@@ -38,6 +38,20 @@ let initialConnection: Promise<unknown> | undefined
  * stalling requests while the client reconnects in the background. Only the
  * first connection after startup is waited for, briefly.
  */
+/**
+ * Whether this process should use Redis: the deployed server with REDIS_URL.
+ * Otherwise the handlers fall back to Next.js' own local caches, so one build
+ * works with or without Memorystore.
+ */
+export function redisConfigured() {
+  // Build-time prerendering also goes through the handlers; only the
+  // deployed server should read and write the shared cache.
+  return (
+    process.env.NEXT_PHASE !== 'phase-production-build' &&
+    !!process.env.REDIS_URL
+  )
+}
+
 export async function getClient(): Promise<Redis | null> {
   if (client === undefined) {
     client = createClient()
@@ -53,16 +67,8 @@ export async function getClient(): Promise<Redis | null> {
 }
 
 function createClient(): Redis | null {
-  // Build-time prerendering also goes through the handlers; only the
-  // deployed server should read and write the shared cache.
-  if (process.env.NEXT_PHASE === 'phase-production-build') return null
-  const url = process.env.REDIS_URL
-  if (!url) {
-    console.warn(
-      '[cloud-run] REDIS_URL is not set; the Redis cache is disabled'
-    )
-    return null
-  }
+  if (!redisConfigured()) return null
+  const url = process.env.REDIS_URL!
   const redis = new Redis(url, {
     enableOfflineQueue: false,
     maxRetriesPerRequest: 1,

@@ -1,15 +1,18 @@
 /**
  * `cacheHandlers` entry for `'use cache'` and `'use cache: remote'`, backed by
  * Redis. Each entry is stored as one value: a 4-byte metadata length, the
- * metadata JSON, then the serialized bytes.
+ * metadata JSON, then the serialized bytes. Without REDIS_URL it is Next.js'
+ * own in-memory default handler.
  */
 import type { CacheEntry, CacheHandler } from 'next/cache.js'
+import { createDefaultCacheHandler } from 'next/dist/server/lib/cache-handlers/default.js'
 import {
   areTagsExpired,
   areTagsStale,
   getClient,
   getTagsExpiration,
   keys,
+  redisConfigured,
   syncTags,
   ttlSeconds,
   updateTags,
@@ -29,8 +32,15 @@ function streamFromBuffer(buffer: Buffer) {
   })
 }
 
+// Next.js' built-in handler at the framework's default `cacheMaxMemorySize`.
+let localHandler: CacheHandler | undefined
+function local() {
+  return (localHandler ??= createDefaultCacheHandler(50 * 1024 * 1024))
+}
+
 const handler: CacheHandler = {
-  async get(cacheKey) {
+  async get(cacheKey, softTags) {
+    if (!redisConfigured()) return local().get(cacheKey, softTags)
     const redis = await getClient()
     if (!redis) return undefined
     await pendingSets.get(cacheKey)
@@ -61,6 +71,7 @@ const handler: CacheHandler = {
   },
 
   async set(cacheKey, pendingEntry) {
+    if (!redisConfigured()) return local().set(cacheKey, pendingEntry)
     const redis = await getClient()
     let resolvePending = () => {}
     pendingSets.set(
@@ -98,6 +109,7 @@ const handler: CacheHandler = {
   },
 
   async refreshTags() {
+    if (!redisConfigured()) return local().refreshTags()
     const redis = await getClient()
     if (!redis) return
     try {
@@ -109,10 +121,12 @@ const handler: CacheHandler = {
   },
 
   async getExpiration(tags) {
+    if (!redisConfigured()) return local().getExpiration(tags)
     return getTagsExpiration(tags)
   },
 
   async updateTags(tags, durations) {
+    if (!redisConfigured()) return local().updateTags(tags, durations)
     await updateTags(await getClient(), tags, durations)
   },
 }

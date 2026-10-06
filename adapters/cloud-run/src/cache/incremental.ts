@@ -1,6 +1,7 @@
 /**
  * `cacheHandler` (singular) backed by Redis: ISR and route responses, the
- * `fetch`/`unstable_cache` data cache and optimized images.
+ * `fetch`/`unstable_cache` data cache and optimized images. Without REDIS_URL
+ * it is Next.js' own file-system cache.
  *
  * Entries missing from Redis fall back to the build's prerendered seeds on
  * local disk, read through Next.js' own file-system cache so the seed format
@@ -18,6 +19,7 @@ import {
   deserialize,
   getClient,
   keys,
+  redisConfigured,
   serialize,
   syncTags,
   ttlSeconds,
@@ -35,17 +37,25 @@ const FileSystemCache = ((FileSystemCacheModule as any).default ??
 const CACHE_TAGS_HEADER = 'x-next-cache-tags'
 
 export default class RedisCacheHandler {
-  private readonly seeds: CacheHandler
+  /** Next.js' own file-system cache, used as is when Redis is not configured. */
+  private readonly local?: CacheHandler
+  /** Read-only access to the build's prerender seeds, in Redis mode. */
+  private readonly seeds?: CacheHandler
 
   constructor(ctx: CacheHandlerContext) {
-    this.seeds = new FileSystemCache({
-      ...ctx,
-      flushToDisk: false,
-      maxMemoryCacheSize: 0,
-    })
+    if (redisConfigured()) {
+      this.seeds = new FileSystemCache({
+        ...ctx,
+        flushToDisk: false,
+        maxMemoryCacheSize: 0,
+      })
+    } else {
+      this.local = new FileSystemCache(ctx)
+    }
   }
 
   async get(key: string, ctx: GetContext): Promise<CacheHandlerValue | null> {
+    if (this.local) return this.local.get(key, ctx)
     const isFetch = ctx.kind === 'FETCH'
     let entry: CacheHandlerValue | null = null
     const redis = await getClient()
@@ -69,7 +79,7 @@ export default class RedisCacheHandler {
     }
 
     if (!entry && !isFetch && ctx.kind !== 'IMAGE') {
-      entry = await this.seeds.get(key, ctx)
+      entry = await this.seeds!.get(key, ctx)
     }
     if (!entry) return null
 
@@ -79,6 +89,7 @@ export default class RedisCacheHandler {
   }
 
   async set(key: string, data: Value, ctx: SetContext) {
+    if (this.local) return this.local.set(key, data, ctx)
     const redis = await getClient()
     if (!redis) return
     const isFetch = 'fetchCache' in ctx && ctx.fetchCache === true
@@ -107,6 +118,7 @@ export default class RedisCacheHandler {
     tags: string | string[],
     durations?: { expire?: number }
   ) {
+    if (this.local) return this.local.revalidateTag(tags, durations)
     await updateTags(
       await getClient(),
       typeof tags === 'string' ? [tags] : tags,
@@ -114,7 +126,9 @@ export default class RedisCacheHandler {
     )
   }
 
-  resetRequestCache() {}
+  resetRequestCache() {
+    this.local?.resetRequestCache?.()
+  }
 
   private checkFetchTags(entry: CacheHandlerValue, ctx: GetContext) {
     const tags =
