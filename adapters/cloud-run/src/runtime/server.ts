@@ -33,14 +33,19 @@ const { resolveRoutes, responseToMiddlewareResult } = nodeRequire(
   './routing.cjs'
 ) as typeof Routing
 
-// Entrypoints resolve the project relative to process.cwd().
-process.chdir(appRoot)
+const projectDir = path.join(appRoot, manifest.relativeProjectDir)
+const distDir = path.join(projectDir, manifest.distDir)
+
+// Run from the project directory like `next start`: entrypoints resolve the
+// project from process.cwd(), and Next.js resolves the relative
+// `cacheHandler`/`cacheHandlers` paths against it.
+process.chdir(projectDir)
 const env = process.env as Record<string, string | undefined>
 env.NODE_ENV ||= 'production'
 if (manifest.turbopack) env.TURBOPACK ||= '1'
+// Scopes the Redis cache handlers' entries to this build.
+env.NEXT_CLOUD_RUN_BUILD_ID ||= manifest.buildId
 
-const projectDir = path.join(appRoot, manifest.relativeProjectDir)
-const distDir = path.join(projectDir, manifest.distDir)
 const staticDir = [
   process.env.NEXT_CLOUD_RUN_STATIC_DIR,
   path.join(appRoot, '.cloud-run-static'),
@@ -59,7 +64,7 @@ const pathnames = [
 // Next.js mutates requestMeta per request (e.g. isRSCRequest), so every
 // invocation gets its own copy.
 const baseRequestMeta = {
-  relativeProjectDir: manifest.relativeProjectDir,
+  relativeProjectDir: '.',
   distDir,
   // Revalidate in-process over loopback instead of the public URL.
   revalidate: async ({

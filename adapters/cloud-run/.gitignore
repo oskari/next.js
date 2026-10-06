@@ -4,3 +4,7 @@ test/fixture/.next/
 test/fixture/.cloud-run/
 test/fixture/next-env.d.ts
 test/fixture/tsconfig.tsbuildinfo
+test/fixture-redis/.next/
+test/fixture-redis/.cloud-run/
+test/fixture-redis/next-env.d.ts
+test/fixture-redis/tsconfig.tsbuildinfo

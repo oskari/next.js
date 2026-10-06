@@ -1,54 +1,13 @@
 // Builds the fixture app with the adapter, starts the generated Cloud Run
 // server locally and checks the main routing paths end to end.
-import { spawn, execFileSync } from 'node:child_process'
-import { createServer } from 'node:net'
 import path from 'node:path'
 import assert from 'node:assert/strict'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { fileURLToPath } from 'node:url'
+import { adapterDir, build, runTests, startServer } from './helpers.mjs'
 
-const adapterDir = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  '..'
-)
 const fixtureDir = path.join(adapterDir, 'test/fixture')
-const env = {
-  ...process.env,
-  NEXT_TELEMETRY_DISABLED: '1',
-  NEXT_ADAPTER_PATH: path.join(adapterDir, 'dist/index.js'),
-}
-
-if (!process.argv.includes('--skip-build')) {
-  execFileSync(
-    process.execPath,
-    [
-      path.join(adapterDir, 'node_modules/next/dist/bin/next'),
-      'build',
-      fixtureDir,
-    ],
-    { env, stdio: 'inherit' }
-  )
-}
-
-const port = await new Promise((resolve) => {
-  const srv = createServer().listen(0, () => {
-    const { port } = srv.address()
-    srv.close(() => resolve(port))
-  })
-})
-const base = `http://127.0.0.1:${port}`
-const server = spawn(
-  process.execPath,
-  [path.join(fixtureDir, '.cloud-run/app/server.mjs')],
-  {
-    env: { ...env, PORT: String(port), HOSTNAME: '127.0.0.1' },
-    stdio: 'inherit',
-  }
-)
-
-async function get(pathname, init) {
-  return fetch(base + pathname, { redirect: 'manual', ...init })
-}
+build(fixtureDir)
+const { get, stop } = await startServer(fixtureDir)
 
 const tests = {
   async 'static page with config headers'() {
@@ -136,28 +95,4 @@ const tests = {
   },
 }
 
-let failed = 0
-try {
-  for (let i = 0; ; i++) {
-    try {
-      await fetch(base)
-      break
-    } catch (err) {
-      if (i > 100) throw err
-      await sleep(100)
-    }
-  }
-  for (const [name, test] of Object.entries(tests)) {
-    try {
-      await test()
-      console.log(`  ✓ ${name}`)
-    } catch (err) {
-      failed++
-      console.log(`  ✗ ${name}\n    ${err.message.split('\n').join('\n    ')}`)
-    }
-  }
-} finally {
-  server.kill('SIGTERM')
-}
-console.log(failed ? `${failed} failed` : 'all passed')
-process.exitCode = failed ? 1 : 0
+await runTests(tests, stop)

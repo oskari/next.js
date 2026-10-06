@@ -7,6 +7,11 @@
 #   SERVICE   Cloud Run service name (default: project directory name)
 #   REGION    Cloud Run region (default: us-central1)
 #   PUBLIC=1  Allow unauthenticated access
+#   REDIS_URL Memorystore endpoint for the Redis cache handlers (build with
+#             NEXT_CLOUD_RUN_CACHE=redis), e.g. redis://10.0.0.3:6379
+#   VPC_NETWORK / VPC_SUBNET
+#             Direct VPC egress so the service can reach Memorystore's
+#             private IP (VPC_SUBNET defaults to VPC_NETWORK)
 #   BUCKET    Optional Cloud Storage bucket for /_next/static assets. Pair it
 #             with NEXT_CLOUD_RUN_ASSET_PREFIX at build time and a load
 #             balancer backend bucket with Cloud CDN enabled.
@@ -50,6 +55,16 @@ args=(
 )
 if [ "${PUBLIC:-}" = "1" ]; then
   args+=(--allow-unauthenticated)
+fi
+if [ -n "${REDIS_URL:-}" ]; then
+  args+=(--update-env-vars "REDIS_URL=$REDIS_URL")
+fi
+if [ -n "${VPC_NETWORK:-}" ]; then
+  args+=(
+    --network "$VPC_NETWORK"
+    --subnet "${VPC_SUBNET:-$VPC_NETWORK}"
+    --vpc-egress private-ranges-only
+  )
 fi
 
 gcloud run deploy "$SERVICE" "${args[@]}" >&2

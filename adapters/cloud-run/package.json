@@ -13,10 +13,11 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "types": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node test/smoke.mjs"
+    "test": "npm run build && node test/smoke.mjs && node test/redis.mjs"
   },
   "dependencies": {
-    "@next/routing": "16.5.0-canary.0"
+    "@next/routing": "16.5.0-canary.0",
+    "ioredis": "6.0.0"
   },
   "devDependencies": {
     "@types/node": "22.19.1",

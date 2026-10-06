@@ -16,10 +16,9 @@ type RouteOutput =
   | NonNullable<BuildCompleteContext['outputs']['middleware']>
 
 const nodeRequire = createRequire(import.meta.url)
-const runtimeDir = path.join(
-  path.dirname(fileURLToPath(import.meta.url)),
-  'runtime'
-)
+const distDir = path.dirname(fileURLToPath(import.meta.url))
+const runtimeDir = path.join(distDir, 'runtime')
+const cacheDir = path.join(distDir, 'cache')
 
 // Build artifacts under distDir that the server never reads at runtime.
 const SKIPPED_DIST_ENTRIES = new Set([
@@ -47,17 +46,32 @@ const adapter: NextAdapter = {
   name: 'cloud-run',
 
   modifyConfig(config, { phase }) {
+    if (phase !== 'phase-production-build') return config
+    const updated = { ...config }
+
     // Serve hashed build assets from Cloud CDN (a Cloud Storage bucket)
     // instead of the Cloud Run service.
     const assetPrefix = process.env.NEXT_CLOUD_RUN_ASSET_PREFIX
-    if (
-      phase === 'phase-production-build' &&
-      assetPrefix &&
-      !config.assetPrefix
-    ) {
-      return { ...config, assetPrefix }
+    if (assetPrefix && !config.assetPrefix) {
+      updated.assetPrefix = assetPrefix
     }
-    return config
+
+    // Share the ISR, data and 'use cache' caches across instances through
+    // Redis (Memorystore). Handlers the app configures itself take priority.
+    if (process.env.NEXT_CLOUD_RUN_CACHE === 'redis') {
+      const useCacheHandler = path.join(cacheDir, 'use-cache.js')
+      updated.cacheHandler ??= path.join(cacheDir, 'incremental.js')
+      // The defaults hold `undefined` entries, so only keep set ones.
+      const configured = Object.fromEntries(
+        Object.entries(config.cacheHandlers ?? {}).filter(([, value]) => value)
+      )
+      updated.cacheHandlers = {
+        default: useCacheHandler,
+        remote: useCacheHandler,
+        ...configured,
+      }
+    }
+    return updated
   },
 
   async onBuildComplete(ctx) {
