@@ -1,0 +1,6 @@
+node_modules/
+dist/
+test/fixture/.next/
+test/fixture/.cloud-run/
+test/fixture/next-env.d.ts
+test/fixture/tsconfig.tsbuildinfo
