@@ -76,6 +76,17 @@ const tests = {
       assert.notEqual(await read(b, '/isr', 'pages'), before)
     })
   },
+  async 'optimized images are shared between instances'() {
+    const url = '/_next/image?url=%2Fphoto.png&w=640&q=75'
+    const headers = { accept: 'image/webp' }
+    const first = await a.get(url, { headers })
+    assert.equal(first.status, 200)
+    assert.equal(first.headers.get('content-type'), 'image/webp')
+    assert.equal(first.headers.get('x-nextjs-cache'), 'MISS')
+    const second = await b.get(url, { headers })
+    assert.equal(second.headers.get('x-nextjs-cache'), 'HIT')
+    assert.equal(second.headers.get('etag'), first.headers.get('etag'))
+  },
   async 'pages still render quickly when Redis is unreachable'() {
     const down = await startServer(fixtureDir, {
       REDIS_URL: `redis://127.0.0.1:${await freePort()}`,

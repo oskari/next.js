@@ -2,14 +2,16 @@
  * Runtime server copied into the container as `.cloud-run-runtime/server.mjs`.
  * It resolves Next.js routing with @next/routing and invokes the matched
  * build entrypoint. Only Node.js built-ins are imported; @next/routing is
- * copied next to this file as a single bundled module.
+ * copied next to this file as a single bundled module, and `/_next/image` is
+ * served by `./image.mjs` (loaded on first use).
  */
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
 import { createRequire } from 'node:module'
 import { Readable } from 'node:stream'
-import { fileURLToPath } from 'node:url'
+import { pipeline } from 'node:stream/promises'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import type * as Routing from '@next/routing'
 import type { CloudRunManifest, FunctionEntry } from '../manifest.js'
 
@@ -57,9 +59,12 @@ createRequire(path.join(projectDir, 'package.json'))('next/setup-node-env')
 
 const port = Number(process.env.PORT) || 8080
 const hostname = process.env.HOSTNAME || '0.0.0.0'
+// `/_next/image` is matched like a filesystem output, as in `next start`:
+// after middleware and beforeFiles rewrites, before afterFiles/fallback.
 const pathnames = [
   ...Object.keys(manifest.functions),
   ...Object.keys(manifest.staticFiles),
+  ...(manifest.images ? [manifest.images.pathname] : []),
 ]
 // Next.js mutates requestMeta per request (e.g. isRSCRequest), so every
 // invocation gets its own copy.
@@ -190,6 +195,16 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     return notFound(req, res, body)
   }
 
+  if (manifest.images && resolved === manifest.images.pathname) {
+    if (result.status) res.statusCode = result.status
+    const handleImage = await loadImageHandler(manifest.images)
+    return handleImage(
+      req,
+      res,
+      result.resolvedQuery ?? Object.fromEntries(url.searchParams)
+    )
+  }
+
   const fn = manifest.functions[resolved]
   if (fn) {
     if (result.invocationTarget) {
@@ -210,6 +225,31 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
   }
 
   return notFound(req, res, body)
+}
+
+type ImageModule = typeof import('./image.js')
+let imageHandler: ReturnType<ImageModule['createImageHandler']> | undefined
+function loadImageHandler(images: NonNullable<CloudRunManifest['images']>) {
+  imageHandler ??= (
+    import(
+      pathToFileURL(path.join(appRoot, '.cloud-run-runtime/image.mjs')).href
+    ) as Promise<ImageModule>
+  )
+    .then(({ createImageHandler }) =>
+      createImageHandler({
+        images,
+        appRoot,
+        projectDir,
+        distDir,
+        handleRequest: handle,
+        waitUntil,
+      })
+    )
+    .catch((err) => {
+      imageHandler = undefined
+      throw err
+    })
+  return imageHandler
 }
 
 async function invokeNode(
@@ -288,11 +328,11 @@ function serveStatic(
     )
   }
   if (req.method === 'HEAD') return res.end()
-  return new Promise<void>((resolve, reject) => {
-    fs.createReadStream(file)
-      .on('error', reject)
-      .pipe(res)
-      .on('finish', resolve)
+  // pipeline settles when either side fails, e.g. a mocked response for an
+  // internal image fetch that exceeds `images.maximumResponseBody`.
+  return pipeline(fs.createReadStream(file), res).catch((err) => {
+    // The client went away mid-transfer; nothing left to send.
+    if (err?.code !== 'ERR_STREAM_PREMATURE_CLOSE') throw err
   })
 }
 

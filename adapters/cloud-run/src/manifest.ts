@@ -33,4 +33,27 @@ export interface CloudRunManifest {
   staticFiles: Record<string, string>
   notFound?: FunctionEntry
   error?: FunctionEntry
+  /** Set when `/_next/image` is served (the default loader, optimized). */
+  images?: ImagesEntry
+}
+
+export interface ImagesEntry {
+  /** URL pathname of the optimizer, including basePath. */
+  pathname: string
+  /**
+   * The parts of the Next.js config that Next's image optimizer reads:
+   * `basePath`, `images`, and the `experimental.imgOpt*`/`isrFlushToDisk`
+   * flags.
+   */
+  nextConfig: {
+    basePath: string
+    images: BuildCompleteContext['config']['images']
+    experimental: Record<string, unknown>
+    cacheMaxMemorySize?: number
+  }
+  /**
+   * `cacheHandler` relative to the container root, when
+   * `images.customCacheHandler` routes optimized images through it.
+   */
+  cacheHandler?: string
 }

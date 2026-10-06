@@ -94,7 +94,9 @@ export async function runTests(tests, cleanup) {
         console.log(`  ✓ ${name}`)
       } catch (err) {
         failed++
-        console.log(`  ✗ ${name}\n    ${err.message.split('\n').join('\n    ')}`)
+        console.log(
+          `  ✗ ${name}\n    ${err.message.split('\n').join('\n    ')}`
+        )
       }
     }
   } finally {

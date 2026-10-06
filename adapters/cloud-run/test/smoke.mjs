@@ -1,13 +1,30 @@
 // Builds the fixture app with the adapter, starts the generated Cloud Run
 // server locally and checks the main routing paths end to end.
+import fs from 'node:fs'
+import http from 'node:http'
 import path from 'node:path'
 import assert from 'node:assert/strict'
 import { setTimeout as sleep } from 'node:timers/promises'
+import sharp from 'sharp'
 import { adapterDir, build, runTests, startServer } from './helpers.mjs'
 
 const fixtureDir = path.join(adapterDir, 'test/fixture')
 build(fixtureDir)
 const { get, stop } = await startServer(fixtureDir)
+
+// A "remote" image origin, allowed by the fixture's images.remotePatterns.
+const photo = fs.readFileSync(path.join(fixtureDir, 'public/photo.png'))
+const remote = http
+  .createServer((req, res) => {
+    res.setHeader('content-type', 'image/png')
+    res.end(photo)
+  })
+  .listen(0, '127.0.0.1')
+await new Promise((resolve) => remote.once('listening', resolve))
+const remoteUrl = `http://127.0.0.1:${remote.address().port}/remote.png`
+
+const image = (url, w = 640, q = 75) =>
+  `/_next/image?url=${encodeURIComponent(url)}&w=${w}&q=${q}`
 
 const tests = {
   async 'static page with config headers'() {
@@ -93,6 +110,115 @@ const tests = {
     }
     assert.fail('ISR page never revalidated')
   },
+  async 'public file'() {
+    const res = await get('/photo.png')
+    assert.equal(res.status, 200)
+    assert.equal(res.headers.get('content-type'), 'image/png')
+  },
+  async 'next/image renders optimizer URLs'() {
+    const html = await (await get('/image')).text()
+    assert.match(html, /\/_next\/image\?url=%2Fphoto\.png&amp;w=640&amp;q=75/)
+    assert.match(html, /\/_next\/image\?url=%2F_next%2Fstatic%2Fmedia%2F/)
+  },
+  async '/_next/image resizes a local image to WebP'() {
+    const res = await get(image('/photo.png'), {
+      headers: { accept: 'image/webp,*/*' },
+    })
+    assert.equal(res.status, 200)
+    assert.equal(res.headers.get('content-type'), 'image/webp')
+    assert.equal(
+      res.headers.get('cache-control'),
+      'public, max-age=14400, must-revalidate'
+    )
+    assert.equal(res.headers.get('vary'), 'Accept')
+    assert.ok(res.headers.get('etag'))
+    assert.equal(
+      res.headers.get('content-disposition'),
+      'attachment; filename="photo.webp"'
+    )
+    assert.match(res.headers.get('content-security-policy'), /sandbox/)
+    const meta = await sharp(Buffer.from(await res.arrayBuffer())).metadata()
+    assert.equal(meta.format, 'webp')
+    assert.equal(meta.width, 640)
+  },
+  async '/_next/image prefers AVIF per Accept and images.formats'() {
+    const res = await get(image('/photo.png', 750), {
+      headers: { accept: 'image/avif,image/webp,*/*' },
+    })
+    assert.equal(res.status, 200)
+    assert.equal(res.headers.get('content-type'), 'image/avif')
+  },
+  async '/_next/image caches optimized images'() {
+    // A fresh source URL, as the image cache outlives --skip-build runs.
+    const url = image(`${remoteUrl}?t=${Date.now()}`, 828)
+    const headers = { accept: 'image/webp' }
+    const first = await get(url, { headers })
+    assert.equal(first.headers.get('x-nextjs-cache'), 'MISS')
+    const second = await get(url, { headers })
+    assert.equal(second.headers.get('x-nextjs-cache'), 'HIT')
+    assert.equal(second.headers.get('etag'), first.headers.get('etag'))
+    // fetch() adds `cache-control: no-cache` to conditional requests, which
+    // rules out a 304, so ask with node:http like a browser would.
+    const status = await new Promise((resolve, reject) => {
+      const { port } = new URL(second.url)
+      http
+        .get(
+          `http://127.0.0.1:${port}${url}`,
+          {
+            headers: { ...headers, 'if-none-match': first.headers.get('etag') },
+          },
+          (res) => resolve(res.resume().statusCode)
+        )
+        .on('error', reject)
+    })
+    assert.equal(status, 304)
+  },
+  async '/_next/image serves imported images as immutable'() {
+    const html = await (await get('/image')).text()
+    const src = html.match(/url=(%2F_next%2Fstatic%2Fmedia%2F[^&]+)/)[1]
+    const res = await get(image(decodeURIComponent(src)), {
+      headers: { accept: 'image/webp' },
+    })
+    assert.equal(res.status, 200)
+    assert.equal(
+      res.headers.get('cache-control'),
+      'public, max-age=315360000, immutable'
+    )
+  },
+  async '/_next/image rejects invalid parameters'() {
+    const cases = [
+      [image('/photo.png', 123), '"w" parameter (width) of 123 is not allowed'],
+      [
+        image('/photo.png', 640, 50),
+        '"q" parameter (quality) of 50 is not allowed',
+      ],
+      ['/_next/image?w=640&q=75', '"url" parameter is required'],
+      [image('https://example.com/a.png'), '"url" parameter is not allowed'],
+    ]
+    for (const [url, message] of cases) {
+      const res = await get(url)
+      assert.equal(res.status, 400, url)
+      assert.equal(await res.text(), message)
+    }
+  },
+  async '/_next/image 404s for a missing local image'() {
+    const res = await get(image('/missing.png'))
+    assert.equal(res.status, 404)
+  },
+  async '/_next/image optimizes an allowed remote image'() {
+    const res = await get(image(remoteUrl), {
+      headers: { accept: 'image/webp' },
+    })
+    assert.equal(res.status, 200)
+    assert.equal(res.headers.get('content-type'), 'image/webp')
+    assert.equal(
+      res.headers.get('content-disposition'),
+      'attachment; filename="remote.webp"'
+    )
+  },
 }
 
-await runTests(tests, stop)
+await runTests(tests, () => {
+  remote.close()
+  return stop()
+})

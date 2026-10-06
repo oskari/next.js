@@ -8,6 +8,12 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 export default {
   outputFileTracingRoot: root,
   turbopack: { root },
+  images: {
+    formats: ['image/avif', 'image/webp'],
+    // The smoke test serves a remote image from a local HTTP server.
+    remotePatterns: [{ protocol: 'http', hostname: '127.0.0.1' }],
+    dangerouslyAllowLocalIP: true,
+  },
   async redirects() {
     return [{ source: '/old', destination: '/', permanent: false }]
   },

@@ -3,7 +3,11 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import type { NextAdapter } from 'next'
-import type { CloudRunManifest, FunctionEntry } from './manifest.js'
+import type {
+  CloudRunManifest,
+  FunctionEntry,
+  ImagesEntry,
+} from './manifest.js'
 
 type BuildCompleteContext = Parameters<
   NonNullable<NextAdapter['onBuildComplete']>
@@ -70,6 +74,11 @@ const adapter: NextAdapter = {
         remote: useCacheHandler,
         ...configured,
       }
+      // Share optimized images (`/_next/image`) through Redis too, unless the
+      // app brings its own cacheHandler and decides that itself.
+      if (!config.cacheHandler && config.images) {
+        updated.images = { ...config.images, customCacheHandler: true }
+      }
     }
     return updated
   },
@@ -129,12 +138,6 @@ const adapter: NextAdapter = {
     }
 
     const { outputs } = ctx
-    const { images } = ctx.config
-    if (!images.unoptimized && images.loader === 'default') {
-      console.warn(
-        '[cloud-run] /_next/image is not served by this adapter yet; set images.unoptimized or a custom images.loader'
-      )
-    }
     for (const output of [
       ...outputs.appPages,
       ...outputs.appRoutes,
@@ -167,17 +170,36 @@ const adapter: NextAdapter = {
       await copyAsset(toRepoRelative(source), source)
     }
 
+    // Build outputs don't include the `public/` folder; serve it like
+    // `next start` does, at `<basePath>/<file>`.
+    const publicDir = path.join(ctx.projectDir, 'public')
+    const publicFiles: { pathname: string; filePath: string }[] = []
+    for (const relative of await fs
+      .readdir(publicDir, { recursive: true })
+      .catch(() => [])) {
+      const filePath = path.join(publicDir, relative)
+      if (!(await fs.stat(filePath)).isFile()) continue
+      publicFiles.push({
+        pathname: `${ctx.config.basePath || ''}/${relative.split(path.sep).join('/')}`,
+        filePath,
+      })
+    }
+
     const staticFiles: Record<string, string> = {}
-    for (const file of outputs.staticFiles) {
+    for (const file of [...outputs.staticFiles, ...publicFiles]) {
       // A static file can share a pathname with a function (e.g. a static
-      // HTML page that also has an RSC function); prefer the function.
+      // HTML page that also has an RSC function); prefer the function. Build
+      // outputs take precedence over public files.
       if (functions[file.pathname]) continue
+      if (!('type' in file) && staticFiles[file.pathname]) continue
       const relative = file.pathname.replace(/^\/+/, '') || 'index'
       const destination = path.join(staticDir, relative)
       await fs.mkdir(path.dirname(destination), { recursive: true })
       await fs.copyFile(file.filePath, destination)
       staticFiles[file.pathname] = relative
     }
+
+    const images = await addImageOptimizer(ctx, copyAsset)
 
     const manifest: CloudRunManifest = {
       version: 1,
@@ -194,6 +216,7 @@ const adapter: NextAdapter = {
       staticFiles,
       notFound: functions['/_not-found'] ?? functions['/404'],
       error: functions['/_error'],
+      images,
     }
     await fs.writeFile(
       path.join(appDir, 'cloud-run-manifest.json'),
@@ -208,10 +231,12 @@ const adapter: NextAdapter = {
       nodeRequire.resolve('@next/routing'),
       path.join(runtimeTarget, 'routing.cjs')
     )
-    await fs.copyFile(
-      path.join(runtimeDir, 'server.js'),
-      path.join(runtimeTarget, 'server.mjs')
-    )
+    for (const file of ['server', 'image']) {
+      await fs.copyFile(
+        path.join(runtimeDir, `${file}.js`),
+        path.join(runtimeTarget, `${file}.mjs`)
+      )
+    }
     await fs.writeFile(
       path.join(appDir, 'server.mjs'),
       "import './.cloud-run-runtime/server.mjs'\n"
@@ -224,6 +249,107 @@ const adapter: NextAdapter = {
       } static files to ${path.relative(ctx.projectDir, outDir)}`
     )
   },
+}
+
+/** The container platform: `node:<major>-slim` is Debian (glibc) on x64. */
+const TARGET = { os: 'linux', cpu: 'x64', libc: 'glibc' }
+
+/**
+ * Prepares `/_next/image`, served like `next start` by Next.js' own image
+ * optimizer. Traces `next/dist/server/image-optimizer` (and through it
+ * `sharp` with its `@img/*` native packages) with the copy of @vercel/nft
+ * that Next.js ships, keeping only the sharp binaries for the container.
+ */
+async function addImageOptimizer(
+  ctx: BuildCompleteContext,
+  copyAsset: (target: string, source: string) => Promise<void>
+): Promise<ImagesEntry | undefined> {
+  const { config } = ctx
+  // Like `next start`, other loaders and unoptimized images 404 here.
+  if (config.images.unoptimized || config.images.loader !== 'default') return
+  if (config.output === 'export') return
+
+  const nextRequire = createRequire(path.join(ctx.projectDir, 'package.json'))
+  const optimizer = nextRequire.resolve('next/dist/server/image-optimizer')
+  const { nodeFileTrace } = nextRequire('next/dist/compiled/@vercel/nft')
+  const { fileList, esmFileList } = await nodeFileTrace([optimizer], {
+    base: ctx.repoRoot,
+  })
+  const files = [...new Set<string>([...fileList, ...esmFileList])]
+
+  // Keep only the `@img/sharp-*` packages that run in the container; the
+  // WebAssembly build is a fallback when no native one is installed.
+  const imgPackage = /(?:^|\/)node_modules\/@img\/([^/]+)\//
+  const platforms = new Map<string, 'native' | 'wasm' | 'other'>()
+  for (const file of files) {
+    const match = file.match(imgPackage)
+    const name = match?.[1]
+    if (!match || !name || platforms.has(name) || name === 'colour') continue
+    const pkgDir = file.slice(0, match.index! + match[0].length)
+    const pkg = JSON.parse(
+      await fs
+        .readFile(path.join(ctx.repoRoot, pkgDir, 'package.json'), 'utf8')
+        .catch(() => '{}')
+    )
+    const matches = (list: string[] | undefined, value: string) =>
+      !list || list.includes(value)
+    platforms.set(
+      name,
+      name.endsWith('-wasm32') || pkg.cpu?.includes('wasm32')
+        ? 'wasm'
+        : matches(pkg.os, TARGET.os) &&
+            matches(pkg.cpu, TARGET.cpu) &&
+            matches(pkg.libc, TARGET.libc)
+          ? 'native'
+          : 'other'
+    )
+  }
+  const hasSharp = files.some((file) =>
+    /(?:^|\/)node_modules\/sharp\/package\.json$/.test(file)
+  )
+  const hasNative = [...platforms.values()].includes('native')
+  const keep = (kind: string | undefined) =>
+    !kind || kind === 'native' || (kind === 'wasm' && !hasNative)
+
+  if (!hasSharp) {
+    console.warn(
+      '[cloud-run] `sharp` was not found, so /_next/image will serve images unoptimized. Install it in the app: npm install sharp'
+    )
+  } else if (![...platforms.values()].some((kind) => keep(kind))) {
+    console.warn(
+      `[cloud-run] sharp has no ${TARGET.os}-${TARGET.cpu} (${TARGET.libc}) binaries installed, so /_next/image will serve images unoptimized in the container. Build on linux x64, or install them: npm install --os=${TARGET.os} --cpu=${TARGET.cpu} --libc=${TARGET.libc} sharp`
+    )
+  }
+
+  for (const file of files) {
+    if (!keep(platforms.get(file.match(imgPackage)?.[1] ?? ''))) continue
+    await copyAsset(file, path.join(ctx.repoRoot, file))
+  }
+
+  const experimental = Object.fromEntries(
+    Object.entries(config.experimental).filter(
+      ([key]) => key.startsWith('imgOpt') || key === 'isrFlushToDisk'
+    )
+  )
+  let cacheHandler: string | undefined
+  if (config.images.customCacheHandler && config.cacheHandler) {
+    const handler = config.cacheHandler.startsWith('file://')
+      ? fileURLToPath(config.cacheHandler)
+      : path.resolve(ctx.projectDir, config.cacheHandler)
+    cacheHandler = path.relative(ctx.repoRoot, handler)
+    await copyAsset(cacheHandler, handler)
+  }
+
+  return {
+    pathname: `${config.basePath || ''}/_next/image`,
+    nextConfig: {
+      basePath: config.basePath || '',
+      images: config.images,
+      experimental,
+      cacheMaxMemorySize: config.cacheMaxMemorySize,
+    },
+    cacheHandler,
+  }
 }
 
 function dockerfile() {
