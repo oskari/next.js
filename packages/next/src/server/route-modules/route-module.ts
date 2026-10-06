@@ -520,23 +520,29 @@ export abstract class RouteModule<
     } else {
       let CacheHandler: any
       const { cacheHandler } = nextConfig
-
-      if (cacheHandler) {
-        const { formatDynamicImportPath } =
-          require('../../lib/format-dynamic-import-path') as typeof import('../../lib/format-dynamic-import-path')
-
-        CacheHandler = interopDefault(
-          await dynamicImportEsmDefault(
-            formatDynamicImportPath(this.distDir, cacheHandler)
-          )
-        )
-      }
       const { join } = require('node:path') as typeof import('node:path')
       const projectDir = join(
         /* turbopackIgnore: true */
         process.cwd(),
         getRequestMeta(req, 'relativeProjectDir') || this.relativeProjectDir
       )
+
+      if (cacheHandler) {
+        const { formatDynamicImportPath } =
+          require('../../lib/format-dynamic-import-path') as typeof import('../../lib/format-dynamic-import-path')
+
+        // The path is relative to distDir, which lives in the project
+        // directory rather than process.cwd() when an adapter invokes the
+        // entrypoint with `relativeProjectDir`.
+        CacheHandler = interopDefault(
+          await dynamicImportEsmDefault(
+            formatDynamicImportPath(
+              `${projectDir}/${this.distDir}`,
+              cacheHandler
+            )
+          )
+        )
+      }
 
       await this.loadCustomCacheHandlers(req, nextConfig)
 
