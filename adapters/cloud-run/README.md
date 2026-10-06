@@ -66,7 +66,7 @@ Build on Linux x64 (or in Cloud Build), so native dependencies match the contain
 
 ### Image optimization
 
-`/_next/image` is served with Next.js' own image optimizer and the same validation, headers and caching as `next start`. Local images are fetched through the server's in-process routing; remote images must match `images.remotePatterns`. Optimized images are cached on the instance's disk, or in Memorystore when the shared cache is enabled. With `images.unoptimized`, a custom `images.loader` or `output: 'export'`, `/_next/image` returns 404 as in `next start`. Without `sharp`, the original image is served and a warning is logged.
+`/_next/image` is served with Next.js' own image optimizer and the same validation, headers and caching as `next start`. Local images are fetched through the server's in-process routing; remote images must match `images.remotePatterns`. Optimized images are cached in the [image cache bucket](#load-balancer-cloud-cdn-and-a-dedicated-image-service) when one is configured, otherwise in Memorystore when the shared cache is enabled, otherwise on the instance's disk (which is memory on Cloud Run). With `images.unoptimized`, a custom `images.loader` or `output: 'export'`, `/_next/image` returns 404 as in `next start`. Without `sharp`, the original image is served and a warning is logged.
 
 ### Shared cache on Memorystore
 
@@ -83,13 +83,43 @@ REDIS_URL=redis://10.0.0.3:6379 VPC_NETWORK=default scripts/deploy.sh .
 - A miss falls back to the build's prerendered pages on local disk.
 - When Redis is unreachable, requests are served as cache misses after at most a one-time 2s wait for the first connection, and tag invalidations apply only on the instance that received them.
 
-### Serving static assets from Cloud CDN (optional)
+### Load balancer, Cloud CDN and a dedicated image service
 
-The service serves `/_next/static` itself, with immutable cache headers. To serve those assets from Cloud CDN instead:
+The service alone serves the whole app. For production traffic, put a global external Application Load Balancer in front of it and give image optimization its own service:
 
-1. Create a Cloud Storage bucket and a global external Application Load Balancer with a backend bucket (Cloud CDN enabled) for `/_next/static/*` and a serverless NEG for the Cloud Run service as the default backend.
-2. Build with `NEXT_CLOUD_RUN_ASSET_PREFIX=https://cdn.example.com` (the adapter sets `assetPrefix`), or leave it unset when the load balancer serves both on one domain.
-3. Deploy with `BUCKET=my-bucket scripts/deploy.sh .`, which uploads the hashed assets before deploying the new revision and never deletes old ones.
+```bash
+NEXT_CLOUD_RUN_CACHE=redis next build
+
+SERVICE=shop REGION=europe-north1 \
+  BUCKET=shop-static IMAGE_CACHE_BUCKET=shop-images-cache \
+  IMAGE_SERVICE=1 \
+  REDIS_URL=redis://10.0.0.3:6379 VPC_NETWORK=default \
+  scripts/deploy.sh .
+
+SERVICE=shop REGION=europe-north1 \
+  BUCKET=shop-static IMAGE_CACHE_BUCKET=shop-images-cache \
+  IMAGE_SERVICE=1 DOMAIN=shop.example.com ARMOR=1 \
+  scripts/setup-lb.sh
+
+# Once DNS points at the load balancer, close the run.app URLs:
+INGRESS=internal-and-cloud-load-balancing ... scripts/deploy.sh .
+```
+
+`scripts/setup-lb.sh` creates the load balancer, or updates it when run again:
+
+| Path              | Backend                                                 | Cloud CDN                |
+| ----------------- | ------------------------------------------------------- | ------------------------ |
+| `/_next/static/*` | Backend bucket on `BUCKET` (hashed assets, made public) | Yes                      |
+| `/_next/image`    | Image service (`IMAGE_SERVICE=1`), otherwise the app    | Yes on the image service |
+| everything else   | App service                                             | Only with `APP_CDN=1`    |
+
+- **Image service.** With `IMAGE_SERVICE=1`, `deploy.sh` deploys the image Cloud Build just built a second time as `$SERVICE-images`, with more memory and CPU and a lower concurrency (`IMAGE_MEMORY`, `IMAGE_CPU`, `IMAGE_CONCURRENCY`, `IMAGE_MAX_INSTANCES`). Image bursts then scale on their own and never slow down page rendering. The service runs the same server, and local source images are inside the image.
+- **Cloud CDN for images.** Optimized images are sent with `Cache-Control: public, max-age=…` (`images.minimumCacheTTL`, 4 hours by default, or a year for static imports) and `Vary: Accept`. Cloud CDN caches them per format, so most image requests never reach Cloud Run.
+- **Cloud CDN for pages.** Next.js pages vary on router headers (`rsc`, `next-router-state-tree`, …), which Cloud CDN does not cache unless they are part of the cache key. `APP_CDN=1` is therefore safe but mainly helps public route handlers and metadata files. Pages cached at the CDN are not purged by `revalidateTag` yet.
+- **Image cache bucket.** With `IMAGE_CACHE_BUCKET`, optimized images are stored in Cloud Storage and shared by every instance of both services, instead of instance memory or Memorystore. `setup-lb.sh` creates the bucket with a lifecycle rule that deletes objects after `IMAGE_CACHE_TTL_DAYS` (30), and grants the services' runtime service accounts object access. Requests use the service's own credentials from the metadata server. If the bucket errors, images are optimized as cache misses; after a timeout the bucket is skipped for 10 seconds, so a slow bucket costs at most one timeout per request.
+- **Static assets.** `deploy.sh` uploads the hashed assets to `BUCKET` before deploying the new revision and never deletes old ones, so clients on the previous deployment keep working. Build with `NEXT_CLOUD_RUN_ASSET_PREFIX=https://cdn.example.com` only when the assets live on a different domain.
+- **Cloud Armor.** `ARMOR=1` attaches a policy with preconfigured XSS and SQLi rules in preview mode: matches are logged but not blocked. Review the logs before enforcing them.
+- `DOMAIN` provisions a Google-managed certificate for HTTPS. Without it the load balancer serves HTTP on port 80. Set `BASE_PATH` when the app uses `basePath`.
 
 ## Configuration
 
@@ -113,7 +143,7 @@ The service serves `/_next/static` itself, with immutable cache headers. To serv
 npm test
 ```
 
-builds `test/fixture` with the adapter, starts the generated server and checks pages, route handlers, rewrites, redirects, middleware, RSC requests, static and `public/` files, image optimization, 404s and ISR revalidation. It then builds `test/fixture-redis` with the Redis handlers and runs two instances against a local `redis-server` (skipped when it is not installed) to check that cached values, tag invalidations, on-demand ISR and optimized images are shared, and that pages stay fast when Redis is down.
+builds `test/fixture` with the adapter, starts the generated server and checks pages, route handlers, rewrites, redirects, middleware, RSC requests, static and `public/` files, image optimization, 404s and ISR revalidation. It then builds `test/fixture-redis` with the Redis handlers and runs two instances against a local `redis-server` (skipped when it is not installed) to check that cached values, tag invalidations, on-demand ISR and optimized images are shared, and that pages stay fast when Redis is down. Finally it runs two instances against a mock of the Cloud Storage API to check the shared image cache, stale regeneration, and fast fallback when the bucket errors or hangs.
 
 ### Next.js compatibility suite
 
@@ -136,7 +166,7 @@ By default each test app runs locally; set `NEXT_CLOUD_RUN_E2E_TARGET=gcp` to de
 - **Edge runtime** outputs are skipped with a warning. The edge runtime is deprecated; use the Node.js runtime.
 - **Caching is per instance** unless the [shared cache](#shared-cache-on-memorystore) is enabled.
 - **Stale-while-revalidate for tagged pages** needs a numeric revalidate time. `revalidateTag(tag, profile)` on a page without one regenerates it on the next request instead of in the background.
-- **Optimized images in Memorystore** count against its memory and keep the default TTL.
+- **Optimized images in Memorystore** count against its memory and keep the default TTL; prefer an image cache bucket.
 - **PPR** works from the origin in one pass; the shell is not served from the CDN.
 - Request bodies are buffered in memory when middleware runs on a request with a body.
 

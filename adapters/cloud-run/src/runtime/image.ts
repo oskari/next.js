@@ -6,7 +6,9 @@
  * image optimizer (`next/dist/server/image-optimizer`), resolved from the
  * app's `next` install like the entrypoints, so validation, fetching,
  * resizing with sharp, caching and response headers match `next start`.
- * This file is the only place the adapter depends on those internals.
+ * This file is the only place the adapter depends on those internals;
+ * `./gcs-image.mjs` (the optional Cloud Storage image cache) only implements
+ * the cache handler contract that `ImageOptimizerCache` calls.
  */
 import type http from 'node:http'
 import { createRequire } from 'node:module'
@@ -45,6 +47,15 @@ export interface ImageHandlerOptions {
   waitUntil: (promise: Promise<unknown>) => void
 }
 
+type GcsImageModule = typeof import('./gcs-image.js')
+
+/** The Cloud Storage image cache module, when a bucket is configured. */
+async function loadGcsImageCache(): Promise<GcsImageModule | undefined> {
+  if (!process.env.NEXT_CLOUD_RUN_IMAGE_CACHE_BUCKET?.trim()) return
+  // A sibling in `.cloud-run-runtime/`, where runtime files are `.mjs`.
+  return import(new URL('./gcs-image.mjs', import.meta.url).href)
+}
+
 export async function createImageHandler({
   images,
   appRoot,
@@ -71,11 +82,21 @@ export async function createImageHandler({
   const nextConfig = images.nextConfig as any
   const imagesConfig = nextConfig.images as ImagesEntry['nextConfig']['images']
 
-  // With `images.customCacheHandler`, optimized images go through the app's
-  // `cacheHandler` (e.g. the Redis handler, shared by all instances) instead
-  // of the instance's local `<distDir>/cache/images`.
+  // Where optimized images are cached, in order of precedence:
+  // - `NEXT_CLOUD_RUN_IMAGE_CACHE_BUCKET`: a Cloud Storage bucket, chosen at
+  //   runtime and shared by all instances and services (`./gcs-image.mjs`).
+  // - `images.customCacheHandler`: the app's `cacheHandler` (e.g. the Redis
+  //   handler), chosen at build time.
+  // - otherwise the instance's local `<distDir>/cache/images`, which lives in
+  //   memory on Cloud Run.
   let cacheHandler: any
-  if (images.cacheHandler) {
+  const gcs = await loadGcsImageCache()
+  if (gcs) {
+    cacheHandler = gcs.gcsImageCacheFromEnv()
+    console.log(
+      `[cloud-run] caching optimized images in ${cacheHandler.location}`
+    )
+  } else if (images.cacheHandler) {
     const mod = await import(
       pathToFileURL(path.join(appRoot, images.cacheHandler)).href
     )

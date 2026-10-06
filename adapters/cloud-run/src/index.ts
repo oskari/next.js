@@ -231,7 +231,7 @@ const adapter: NextAdapter = {
       nodeRequire.resolve('@next/routing'),
       path.join(runtimeTarget, 'routing.cjs')
     )
-    for (const file of ['server', 'image']) {
+    for (const file of ['server', 'image', 'gcs-image']) {
       await fs.copyFile(
         path.join(runtimeDir, `${file}.js`),
         path.join(runtimeTarget, `${file}.mjs`)
